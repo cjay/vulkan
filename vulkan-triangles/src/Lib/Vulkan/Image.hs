@@ -76,10 +76,10 @@ createTextureImageView pdev dev cmdPool cmdQueue path = do
     copyBufferToImage dev cmdPool cmdQueue stagingBuf image
       (fromIntegral imageWidth) (fromIntegral imageHeight)
 
-  runCommandsOnce dev cmdPool cmdQueue $
+  runCommandsOnce dev cmdPool cmdQueue $ \cmdBuf -> do
+    generateMipmaps pdev image VK_FORMAT_R8G8B8A8_UNORM (fromIntegral imageWidth) (fromIntegral imageHeight) mipLevels cmdBuf
     -- generateMipmaps does this as a side effect:
-    -- transitionImageLayout image VK_FORMAT_R8G8B8A8_UNORM TransDst_ShaderRO mipLevels
-    generateMipmaps pdev image VK_FORMAT_R8G8B8A8_UNORM (fromIntegral imageWidth) (fromIntegral imageHeight) mipLevels
+    -- transitionImageLayout image VK_FORMAT_R8G8B8A8_UNORM TransDst_ShaderRO mipLevels cmdBuf
 
   imageView <- createImageView dev image VK_FORMAT_R8G8B8A8_UNORM VK_IMAGE_ASPECT_COLOR_BIT mipLevels
 
@@ -101,16 +101,28 @@ generateMipmaps pdev image format width height mipLevels cmdBuf = do
                   .&. VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT
    in when (supported == 0) $
       throwVkMsg "texture image format does not support linear blitting!"
+
+  let barrier = barrierStruct 0
+        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
+        VK_ACCESS_TRANSFER_WRITE_BIT VK_ACCESS_TRANSFER_READ_BIT
+   in withVkPtr barrier $ \barrPtr -> liftIO $
+      vkCmdPipelineBarrier cmdBuf
+        VK_PIPELINE_STAGE_TRANSFER_BIT VK_PIPELINE_STAGE_TRANSFER_BIT
+        0
+        0 VK_NULL
+        0 VK_NULL
+        1 barrPtr
+
   mapM_ createLvl
-    (zip3
-     [1 .. mipLevels-1]
+    (drop 1 $ zip3
+     [0 .. mipLevels-1]
      (iterate nextLen (fromIntegral width))
      (iterate nextLen (fromIntegral height)))
 
-  let barrier = barrierStruct (mipLevels - 1)
+  let barrier = barrierStruct 0
         VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-        VK_ACCESS_TRANSFER_WRITE_BIT VK_ACCESS_SHADER_READ_BIT
-   in withVkPtr barrier $ \barrPtr -> liftIO $
+        VK_ACCESS_TRANSFER_READ_BIT VK_ACCESS_SHADER_READ_BIT
+    in withVkPtr barrier $ \barrPtr -> liftIO $
       vkCmdPipelineBarrier cmdBuf
         VK_PIPELINE_STAGE_TRANSFER_BIT VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
         0
@@ -121,6 +133,7 @@ generateMipmaps pdev image format width height mipLevels cmdBuf = do
   where
 
   nextLen l = if l > 1 then l `div` 2 else 1
+
   barrierStruct mipLevel oldLayout newLayout srcAccessMask dstAccessMask =
     createVk @VkImageMemoryBarrier
     $  set @"sType" VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
@@ -139,7 +152,8 @@ generateMipmaps pdev image format width height mipLevels cmdBuf = do
         )
     &* set @"srcAccessMask" srcAccessMask
     &* set @"dstAccessMask" dstAccessMask
-  blitStruct mipLevel srcWidth srcHeight =
+
+  blitStruct mipLevel mipWidth mipHeight =
     createVk @VkImageBlit
     $  setAt @"srcOffsets" @0
         (createVk
@@ -149,8 +163,8 @@ generateMipmaps pdev image format width height mipLevels cmdBuf = do
         )
     &* setAt @"srcOffsets" @1
         (createVk
-         $  set @"x" srcWidth
-         &* set @"y" srcHeight
+         $  set @"x" (fromIntegral width)
+         &* set @"y" (fromIntegral height)
          &* set @"z" 1
         )
     &* setAt @"dstOffsets" @0
@@ -161,13 +175,13 @@ generateMipmaps pdev image format width height mipLevels cmdBuf = do
         )
     &* setAt @"dstOffsets" @1
         (createVk
-         $  set @"x" (nextLen srcWidth)
-         &* set @"y" (nextLen srcHeight)
+         $  set @"x" mipWidth
+         &* set @"y" mipHeight
          &* set @"z" 1
         )
     &* setVk @"srcSubresource"
         (  set @"aspectMask" VK_IMAGE_ASPECT_COLOR_BIT
-        &* set @"mipLevel" (mipLevel - 1)
+        &* set @"mipLevel" 0
         &* set @"baseArrayLayer" 0
         &* set @"layerCount" 1
         )
@@ -177,28 +191,18 @@ generateMipmaps pdev image format width height mipLevels cmdBuf = do
         &* set @"baseArrayLayer" 0
         &* set @"layerCount" 1
         )
-  createLvl (mipLevel, srcWidth, srcHeight) = do
-    let barrier = barrierStruct (mipLevel - 1)
-          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
-          VK_ACCESS_TRANSFER_WRITE_BIT VK_ACCESS_TRANSFER_READ_BIT
-     in withVkPtr barrier $ \barrPtr -> liftIO $
-        vkCmdPipelineBarrier cmdBuf
-          VK_PIPELINE_STAGE_TRANSFER_BIT VK_PIPELINE_STAGE_TRANSFER_BIT
-          0
-          0 VK_NULL
-          0 VK_NULL
-          1 barrPtr
 
-    withVkPtr (blitStruct mipLevel srcWidth srcHeight) $ \blitPtr -> liftIO $
+  createLvl (mipLevel, mipWidth, mipHeight) = do
+    withVkPtr (blitStruct mipLevel mipWidth mipHeight) $ \blitPtr -> liftIO $
       vkCmdBlitImage cmdBuf
         image VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL
         image VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL
         1 blitPtr
         VK_FILTER_LINEAR
 
-    let barrier = barrierStruct (mipLevel - 1)
-          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
-          VK_ACCESS_TRANSFER_READ_BIT VK_ACCESS_SHADER_READ_BIT
+    let barrier = barrierStruct mipLevel
+          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+          VK_ACCESS_TRANSFER_WRITE_BIT VK_ACCESS_SHADER_READ_BIT
      in withVkPtr barrier $ \barrPtr -> liftIO $
         vkCmdPipelineBarrier cmdBuf
           VK_PIPELINE_STAGE_TRANSFER_BIT VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT
